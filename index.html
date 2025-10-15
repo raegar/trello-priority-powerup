@@ -141,11 +141,11 @@ window.TrelloPowerUp.initialize({
   },
   "show-authorization": function(t){
     return t.popup({
-      title: "Authorise Trello",
-      url: "./auth.html",
-      height: 680
+        title: "Authorise Trello",
+        url: t.signUrl("./auth.html"),  
+        height: 680
     });
-  },
+    },
 
   /** Card button: Set Priority **/
   "card-buttons": function(t){
