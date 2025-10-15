@@ -1,0 +1,34 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Authorize Trello</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>body{font:14px system-ui,Segoe UI,Roboto,Helvetica,Arial;padding:16px}</style>
+</head>
+<body>
+  <h2>Authorize Trello</h2>
+  <p>This Power-Up needs permission to read and write your board (to add labels and reorder cards).</p>
+  <button id="auth">Authorize</button>
+
+  <script src="https://p.trellocdn.com/power-up.min.js"></script>
+  <script src="https://trello.com/1/client.js?key=YOUR_TRELLO_API_KEY"></script>
+  <script>
+    const t = window.TrelloPowerUp.iframe();
+
+    document.getElementById('auth').addEventListener('click', function(){
+      Trello.authorize({
+        type: 'popup',
+        name: 'Priority Power-Up',
+        scope: { read: true, write: true },
+        expiration: 'never',
+        success: function(){
+          const token = Trello.token();
+          t.set('member','private','trelloToken', token).then(()=> t.closePopup());
+        },
+        error: function(err){ alert('Auth failed'); console.error(err); }
+      });
+    });
+  </script>
+</body>
+</html>
