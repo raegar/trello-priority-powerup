@@ -1,0 +1,210 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Priority Power-Up</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+</head>
+<body>
+<script src="https://p.trellocdn.com/power-up.min.js"></script>
+<script>
+/** CONFIG **/
+const APP_NAME = "Priority Power-Up";
+const TRELLO_KEY = "YOUR_TRELLO_API_KEY"; // get from trello.com/app-key
+const LABELS = [
+  { name: "P1", display: "Urgent", weight: 1 },
+  { name: "P2", display: "High",   weight: 2 },
+  { name: "P3", display: "Medium", weight: 3 },
+  { name: "P4", display: "Low",    weight: 4 },
+];
+const LABEL_NAME_TO_WEIGHT =
+  Object.fromEntries(LABELS.map(l => [l.name, l.weight]));
+
+/** Simple token storage (member-private) **/
+async function getToken(t){ return await t.get("member","private","trelloToken", null); }
+async function setToken(t,token){ return await t.set("member","private","trelloToken", token); }
+
+function trelloApi(path, method="GET", token=null, body=null){
+  const url = new URL(`https://api.trello.com/1/${path}`);
+  url.searchParams.set("key", TRELLO_KEY);
+  if(token) url.searchParams.set("token", token);
+  const opts = { method, headers: { "Content-Type": "application/json" } };
+  if(body) opts.body = JSON.stringify(body);
+  return fetch(url.toString(), opts).then(r=>{
+    if(!r.ok) throw new Error(`${method} ${path} failed: ${r.status}`);
+    return r.json();
+  });
+}
+
+/** Ensure P1..P4 labels exist on the board; return map name->label */
+async function ensurePriorityLabels(t, token){
+  const { id: boardId } = await t.board("id");
+  const labels = await trelloApi(`boards/${boardId}/labels?limit=1000`, "GET", token);
+  const map = new Map(labels.map(l => [l.name, l]));
+  // create any missing
+  for(const l of LABELS){
+    if(!map.has(l.name)){
+      const created = await trelloApi(
+        `labels?idBoard=${boardId}&name=${encodeURIComponent(l.name)}`,
+        "POST",
+        token
+      );
+      map.set(created.name, created);
+    }
+  }
+  return Object.fromEntries(map);
+}
+
+/** Assign exactly one P* label to a card */
+async function setCardPriorityByLabel(t, token, cardId, targetLabelName){
+  const card = await trelloApi(`cards/${cardId}?fields=id,name,idLabels`, "GET", token);
+  const { id: boardId } = await t.board("id");
+  const labelMap = await ensurePriorityLabels(t, token);
+
+  // remove any existing P* labels
+  const currentPLabels = card.idLabels.filter(idLbl => {
+    const lbl = Object.values(labelMap).find(x => x.id === idLbl);
+    return lbl && LABEL_NAME_TO_WEIGHT.hasOwnProperty(lbl.name);
+  });
+  for(const idLbl of currentPLabels){
+    await trelloApi(`cards/${cardId}/idLabels/${idLbl}`, "DELETE", token);
+  }
+
+  // add the target
+  const target = labelMap[targetLabelName];
+  if(target) await trelloApi(`cards/${cardId}/idLabels`, "POST", token, { value: target.id });
+}
+
+/** Determine a card's numeric weight from its labels (default large) */
+function getWeightFromLabels(card, labelMapById){
+  let best = 999;
+  for(const idLbl of card.idLabels){
+    const lbl = labelMapById.get(idLbl);
+    if(!lbl) continue;
+    const w = LABEL_NAME_TO_WEIGHT[lbl.name];
+    if(w) best = Math.min(best, w);
+  }
+  return best;
+}
+
+/** Sort the cards in a list by priority (P1->P4, then unranked) */
+async function sortListByPriority(t, token, listId){
+  // fetch labels map (id -> label)
+  const { id: boardId } = await t.board("id");
+  const labels = await trelloApi(`boards/${boardId}/labels?limit=1000`, "GET", token);
+  const labelById = new Map(labels.map(l => [l.id, l]));
+
+  // fetch cards in list
+  const cards = await trelloApi(`lists/${listId}/cards?fields=id,name,idLabels,pos`, "GET", token);
+
+  // sort by (weight, then name as stable tiebreak)
+  cards.sort((a,b) => {
+    const wa = getWeightFromLabels(a, labelById);
+    const wb = getWeightFromLabels(b, labelById);
+    if(wa !== wb) return wa - wb;
+    return a.name.localeCompare(b.name);
+  });
+
+  // Reorder in Trello by repeatedly placing from lowest to highest at 'top'
+  // (so the highest priority ends up on top last).
+  const ordered = [...cards]; // already ascending: P1..P4..unranked
+  for(let i = ordered.length - 1; i >= 0; i--){
+    await trelloApi(`cards/${ordered[i].id}`, "PUT", token, { pos: "top" });
+  }
+}
+
+/** UI helpers **/
+function priorityItems(callback){
+  return LABELS.map(l => ({
+    text: `${l.name} — ${l.display}`,
+    callback: () => callback(l.name)
+  })).concat([{ text: "Clear priority", callback: () => callback(null) }]);
+}
+
+async function showListPicker(t, token, action){
+  const { id: boardId } = await t.board("id");
+  const lists = await trelloApi(`boards/${boardId}/lists?fields=id,name&cards=none`, "GET", token);
+  return t.popup({
+    title: "Select a list",
+    items: lists.map(list => ({
+      text: list.name,
+      callback: () => action(list.id, list.name)
+    }))
+  });
+}
+
+/** Auth capability **/
+window.TrelloPowerUp.initialize({
+  "authorization-status": async function(t){
+    const token = await getToken(t);
+    return { authorized: !!token };
+  },
+  "show-authorization": function(t){
+    return t.popup({
+      title: "Authorise Trello",
+      url: "./auth.html",
+      height: 680
+    });
+  },
+
+  /** Card button: Set Priority **/
+  "card-buttons": function(t){
+    return [{
+      text: "Set Priority",
+      callback: async (t) => {
+        const token = await getToken(t);
+        if(!token) { await t.requestAuthorization(); return; }
+        const card = await t.card("id","name");
+        return t.popup({
+          title: `Priority for "${card.name}"`,
+          items: priorityItems(async (choice)=>{
+            if(choice){
+              await setCardPriorityByLabel(t, token, card.id, choice);
+            }else{
+              // clear any priority labels
+              await setCardPriorityByLabel(t, token, card.id, "__NONE__");
+            }
+            t.closePopup();
+          })
+        });
+      }
+    }];
+  },
+
+  /** Badge: show P* on card face **/
+  "card-badges": async function(t){
+    const token = await getToken(t);
+    if(!token) return []; // badge requires auth
+    const card = await trelloApi(`cards/${(await t.card("id")).id}?fields=idLabels,name`, "GET", token);
+    const { id: boardId } = await t.board("id");
+    const labels = await trelloApi(`boards/${boardId}/labels?limit=1000`, "GET", token);
+    const byId = new Map(labels.map(l => [l.id, l]));
+    let bestLabel = null, bestW = 999;
+    for(const idLbl of card.idLabels){
+      const lbl = byId.get(idLbl);
+      if(!lbl) continue;
+      const w = LABEL_NAME_TO_WEIGHT[lbl.name];
+      if(w && w < bestW){ bestW = w; bestLabel = lbl.name; }
+    }
+    return bestLabel ? [{ text: bestLabel }] : [];
+  },
+
+  /** Board button: Sort list by Priority **/
+  "board-buttons": function(t){
+    return [{
+      text: "Sort List by Priority",
+      callback: async (t) => {
+        const token = await getToken(t);
+        if(!token) { await t.requestAuthorization(); return; }
+        await showListPicker(t, token, async (listId, listName)=>{
+          await t.alert({ message: `Sorting "${listName}"…` });
+          await sortListByPriority(t, token, listId);
+          await t.alert({ message: `Sorted "${listName}" by priority.` });
+        });
+      }
+    }];
+  }
+});
+</script>
+</body>
+</html>
